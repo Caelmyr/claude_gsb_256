@@ -3,14 +3,15 @@
 这是各模块的粘合层：图像管理、流水线 CRUD、运行、特征/检测/分割/风格、
 批处理、结果对比、预设、历史。单图运算接口统一走 _run_op（带缓存）。
 """
+import base64
 import io
 import json
 
 from flask import Blueprint, jsonify, request, send_file
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageOps, UnidentifiedImageError
 
 from . import config, pipeline as pipeline_engine
-from .algorithms import detection, features, segmentation, style, util
+from .algorithms import collage as collage_engine, detection, features, segmentation, style, util
 from .batch import BatchManager, process_image
 from .cache import ResultCache, make_key
 from .history import HistoryManager
@@ -503,6 +504,151 @@ def colorize_heat(gray):
         out = Image.new("RGB", gray.size)
         out.putdata([lut[v] for v in gray.getdata()])
         return out
+
+
+# ---------------------------------------------------------------------------
+# 拼图 / 拼贴
+# ---------------------------------------------------------------------------
+def _collage_params(data):
+    """解析并校验拼图参数。返回 (params, error)。"""
+    mode = data.get("mode", "horizontal")
+    if mode not in collage_engine.MODES:
+        return None, "拼接方式只能是 horizontal / vertical / grid"
+    scaling = data.get("scaling", "uniform")
+    if scaling not in collage_engine.SCALINGS:
+        return None, "缩放策略只能是 uniform / original"
+    align = data.get("align", "start")
+    if align not in collage_engine.ALIGNS:
+        return None, "对齐方式只能是 start / center / end"
+    try:
+        gap = int(data.get("gap", 8))
+    except (TypeError, ValueError):
+        return None, "间距必须是整数"
+    if not 0 <= gap <= 500:
+        return None, "间距需在 0~500px 之间"
+    columns = data.get("columns")
+    if columns in ("", None):
+        columns = 0
+    try:
+        columns = int(columns)
+    except (TypeError, ValueError):
+        return None, "列数必须是整数"
+    if columns < 0 or columns > config.COLLAGE_MAX_IMAGES:
+        return None, f"列数需在 0~{config.COLLAGE_MAX_IMAGES} 之间"
+    return {
+        "mode": mode, "scaling": scaling, "align": align,
+        "gap": gap, "columns": columns,
+        "background": data.get("background", "#ffffff"),
+    }, None
+
+
+def _load_collage_items(items):
+    """按顺序逐个打开拼图素材；任何一张失败都不影响其余。
+
+    items: [{"image_id": ..., "name": 可选展示名}]（也接受纯 id 字符串）
+    返回 (images, order_info, failed)：
+      images     成功打开的 PIL 图（保持入参顺序）
+      order_info 与 images 对齐的 {index, id, filename}（index 为入参位置）
+      failed     [{index, image_id, filename, reason}]
+    """
+    images, order_info, failed = [], [], []
+    for index, it in enumerate(items):
+        image_id = it.get("image_id") if isinstance(it, dict) else it
+        name = (it.get("name") if isinstance(it, dict) else None)
+        rec = image_store.get(image_id) if image_id else None
+        if not rec:
+            failed.append({"index": index, "image_id": image_id, "filename": name or "",
+                           "reason": "图像不存在（可能已被删除）"})
+            continue
+        path = image_store.file_path(image_id)
+        try:
+            img = Image.open(path)
+            img.load()  # 触发解码，把损坏文件在此处识别为失败
+            img = ImageOps.exif_transpose(img)
+        except (UnidentifiedImageError, OSError, ValueError) as exc:
+            failed.append({"index": index, "image_id": image_id,
+                           "filename": rec.get("filename", name or ""),
+                           "reason": f"无法读取图像：{exc}"})
+            continue
+        except Exception as exc:  # noqa: BLE001 —— 单张失败必须隔离
+            failed.append({"index": index, "image_id": image_id,
+                           "filename": rec.get("filename", name or ""),
+                           "reason": f"打开失败：{exc}"})
+            continue
+        images.append(img)
+        order_info.append({"index": index, "image_id": image_id,
+                           "filename": rec.get("filename", "")})
+    return images, order_info, failed
+
+
+def _collage_payload(data, max_dim):
+    """拼图共用流程：校验 -> 逐张开图（隔离失败）-> 渲染。"""
+    items = data.get("items")
+    if not isinstance(items, list):
+        items = data.get("image_ids")  # 兼容只传 id 列表
+    if not isinstance(items, list) or not items:
+        return None, ({"error": "请先选择至少 2 张图像"}, 400)
+    if len(items) > config.COLLAGE_MAX_IMAGES:
+        return None, ({"error": f"单次最多拼接 {config.COLLAGE_MAX_IMAGES} 张"}, 400)
+
+    params, err = _collage_params(data)
+    if err:
+        return None, ({"error": err}, 400)
+
+    images, order_info, failed = _load_collage_items(items)
+    if len(images) < 2:
+        return None, ({"error": "可拼接的图像不足 2 张", "failed": failed}, 400)
+
+    canvas, meta = collage_engine.render(images, params, max_dim)
+    meta["failed"] = failed
+    return (canvas, meta, order_info), None
+
+
+@bp.post("/collage/preview")
+def collage_preview():
+    """低清布局预览：返回 JPEG data URL + 每张图的布局矩形，供前端叠框。"""
+    data = request.get_json(silent=True) or {}
+    out, err = _collage_payload(data, config.COLLAGE_PREVIEW_DIM)
+    if err:
+        return jsonify(err[0]), err[1]
+    canvas, meta, _ = out
+    buf = io.BytesIO()
+    canvas.save(buf, "JPEG", quality=86)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return jsonify({**meta, "preview_url": f"data:image/jpeg;base64,{b64}"})
+
+
+@bp.post("/collage")
+def collage_create():
+    """全量拼图并把结果存入结果缓存，返回可下载的新图 URL。"""
+    data = request.get_json(silent=True) or {}
+    out, err = _collage_payload(data, config.COLLAGE_MAX_DIM)
+    if err:
+        return jsonify(err[0]), err[1]
+    canvas, meta, order_info = out
+
+    # 结果缓存：相同素材（含顺序）+ 相同参数命中同一张结果
+    ordered_ids = [o["image_id"] for o in order_info]
+    key_params = {k: meta[k] for k in ("mode", "scaling", "gap", "align", "background", "columns")}
+    key = make_key("collage", json.dumps(ordered_ids), json.dumps(key_params, sort_keys=True))
+    cached_id = cache.get(key)
+    if cached_id:
+        result_id = cached_id
+    else:
+        result_id = cache.put(key, canvas, {
+            "kind": "collage",
+            "sources": order_info,
+            "failed": meta["failed"],
+            "params": key_params,
+        })
+    return jsonify({
+        "result_id": result_id,
+        "cache_hit": bool(cached_id),
+        "file_url": f"/api/results/{result_id}/file",
+        "width": meta["width"], "height": meta["height"],
+        "count": meta["count"], "columns": meta["columns"], "rows": meta["rows"],
+        "failed": meta["failed"],
+    })
 
 
 # ---------------------------------------------------------------------------

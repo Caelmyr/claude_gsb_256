@@ -35,6 +35,10 @@ PREVIEW_DIM = 900                 # 前端展示/下载的完整预览尺寸
 THUMB_DIM = 220                   # 缩略图最长边
 FEATURE_WORK_DIM = 360            # 特征提取/检测/分割的工作分辨率（加速）
 
+COLLAGE_MAX_DIM = 3200            # 拼图结果最长边上限（长图也不至于失控）
+COLLAGE_PREVIEW_DIM = 1000        # 拼图预览最长边
+COLLAGE_MAX_IMAGES = 20           # 单次拼图最多张数
+
 MAX_BATCH_WORKERS = 2             # 批处理线程池大小（CPU 密集，控制内存）
 CACHE_MAX_BYTES = 256 * 1024 * 1024
 CACHE_MAX_ENTRIES = 400
