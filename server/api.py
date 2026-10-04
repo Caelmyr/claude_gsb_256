@@ -10,6 +10,7 @@ from flask import Blueprint, jsonify, request, send_file
 from PIL import Image, ImageChops
 
 from . import config, pipeline as pipeline_engine
+from . import collage as collage_engine
 from .algorithms import detection, features, segmentation, style, util
 from .batch import BatchManager, process_image
 from .cache import ResultCache, make_key
@@ -503,6 +504,107 @@ def colorize_heat(gray):
         out = Image.new("RGB", gray.size)
         out.putdata([lut[v] for v in gray.getdata()])
         return out
+
+
+# ---------------------------------------------------------------------------
+# 拼图（多图拼接 / 长图 / 拼贴画）
+# ---------------------------------------------------------------------------
+def _collage_payload(data):
+    """解析拼图请求的公共部分：顺序化的图片列表与参数。"""
+    raw = data.get("images")
+    if not isinstance(raw, list) or not raw:
+        return None, None, ({"error": "请至少选择 1 张图片"}, 400)
+    if len(raw) > collage_engine.MAX_IMAGES:
+        return None, None, ({"error": f"最多拼接 {collage_engine.MAX_IMAGES} 张图片"}, 400)
+
+    ordered = []
+    for i, item in enumerate(raw):
+        if isinstance(item, str):
+            ordered.append({"id": item})
+        elif isinstance(item, dict) and item.get("id"):
+            ordered.append({"id": str(item["id"]),
+                            "filename": str(item.get("filename", ""))})
+        else:
+            return None, None, ({"error": f"第 {i + 1} 项缺少图像 id"}, 400)
+
+    try:
+        params = collage_engine.normalize_params(data)
+    except collage_engine.CollageError as exc:
+        return None, None, ({"error": str(exc)}, 400)
+    return ordered, params, None
+
+
+def _collage_loader(image_id):
+    """按图像库 id 载入 PIL 图；缺失/损坏抛异常，由拼图引擎逐张隔离。"""
+    path = image_store.file_path(image_id)
+    if not path:
+        raise ValueError("图像不存在")
+    return Image.open(path)
+
+
+@bp.post("/collage/preview")
+def collage_preview():
+    """只做布局计算（不渲染像素）：供前端实时预览排列与逐槽位置。"""
+    data = request.get_json(silent=True) or {}
+    ordered, params, err = _collage_payload(data)
+    if err:
+        return jsonify(err[0]), err[1]
+
+    sources, failed = [], []
+    for idx, entry in enumerate(ordered):
+        rec = image_store.get(entry["id"])
+        path = image_store.file_path(entry["id"])
+        if not rec or not path:
+            failed.append({"id": entry["id"], "index": idx,
+                           "filename": entry.get("filename", ""), "reason": "图像不存在"})
+            continue
+        w, h = collage_engine.source_work_size(rec["width"], rec["height"])
+        sources.append({"id": entry["id"], "index": idx, "width": w, "height": h})
+
+    if not sources:
+        return jsonify({"error": "没有可用图片", "failed": failed}), 400
+
+    plan = collage_engine.plan_layout(sources, {**params, "_normalized": True})
+    return jsonify({"plan": plan, "failed": failed,
+                    "requested": len(ordered), "succeeded": len(sources)})
+
+
+@bp.post("/collage")
+def collage_run():
+    """执行拼接。save=true 时把成品作为新图存入图像库（一键保存）。
+
+    任何一张源图失败都不影响其余图片；失败项在 failed 里单独列出。
+    """
+    data = request.get_json(silent=True) or {}
+    ordered, params, err = _collage_payload(data)
+    if err:
+        return jsonify(err[0]), err[1]
+
+    canvas, plan, failed = collage_engine.render(ordered, {**params, "_normalized": True},
+                                                 _collage_loader)
+    if canvas is None:
+        return jsonify({"error": "全部图片均无法处理", "failed": failed}), 400
+
+    key = make_key("collage", json.dumps(
+        [{"id": e["id"]} for e in ordered if not any(f["id"] == e["id"] for f in failed)],
+        sort_keys=True),
+        json.dumps(params, sort_keys=True, default=str))
+    result_id = cache.put(key, canvas, {"kind": "collage", "failed": failed})
+
+    saved_view = None
+    if data.get("save"):
+        stamp = __import__("datetime").datetime.now().strftime("%Y%m%d-%H%M%S")
+        rec = image_store.save_result_image(canvas, f"拼图_{stamp}.png")
+        saved_view = _image_view(rec)
+
+    return jsonify({
+        "result_id": result_id,
+        "file_url": f"/api/results/{result_id}/file",
+        "width": plan["width"], "height": plan["height"],
+        "plan": plan, "failed": failed,
+        "requested": len(ordered), "succeeded": len(plan["items"]),
+        "saved_image": saved_view,
+    })
 
 
 # ---------------------------------------------------------------------------

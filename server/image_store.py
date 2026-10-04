@@ -120,6 +120,16 @@ class ImageStore:
             except OSError:
                 pass
 
+    def save_result_image(self, img, filename="collage.png"):
+        """把平台内生成的成品图（如拼图结果）作为新图入库。
+
+        走与上传相同的内容寻址路径：先编码成 PNG 字节再 save_upload，
+        天然去重并生成缩略图。返回图像记录。
+        """
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        return self.save_upload(buf.getvalue(), filename)
+
     def update_meta(self, image_id, fields):
         """更新 tags / note / filename 等轻量字段。"""
         def _upd(doc):
